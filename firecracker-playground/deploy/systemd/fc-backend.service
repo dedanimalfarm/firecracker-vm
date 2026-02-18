@@ -1,0 +1,15 @@
+[Unit]
+Description=Firecracker session backend
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/firecracker-playground/env
+ExecStart=/usr/bin/node /opt/firecracker-playground/app/server.js
+WorkingDirectory=/opt/firecracker-playground/app
+Restart=always
+RestartSec=2
+User=root
+
+[Install]
+WantedBy=multi-user.target

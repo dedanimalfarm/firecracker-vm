@@ -1,0 +1,13 @@
+﻿# Node
+firecracker-playground/app/node_modules/
+
+# Local runtime and artifacts
+firecracker-playground/images/
+firecracker-playground/vms/
+firecracker-playground/**/*.rootfs.ext4
+firecracker-playground/**/*.socket
+firecracker-playground/**/*.log
+
+# Local env/secrets
+firecracker-playground/.env
+firecracker-playground/**/id_*
