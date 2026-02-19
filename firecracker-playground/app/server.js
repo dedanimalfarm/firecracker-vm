@@ -39,6 +39,7 @@ const TTYD_BIN = env('TTYD_BIN', '/usr/local/bin/ttyd');
 const API_TOKEN = env('API_TOKEN', '');
 const RATE_LIMIT_WINDOW_MS = envInt('RATE_LIMIT_WINDOW_MS', 60000);
 const RATE_LIMIT_MAX = envInt('RATE_LIMIT_MAX', 10);
+const SSH_BOOT_TIMEOUT_MS = envInt('SSH_BOOT_TIMEOUT_MS', 45000);
 
 if (IP_START < 1 || IP_START > 254 || IP_MAX < 1 || IP_MAX > 254 || IP_START > IP_MAX) {
   throw new Error('Invalid IP allocation range. Check IP_START and IP_MAX.');
@@ -46,6 +47,10 @@ if (IP_START < 1 || IP_START > 254 || IP_MAX < 1 || IP_MAX > 254 || IP_START > I
 
 if (RATE_LIMIT_WINDOW_MS < 1 || RATE_LIMIT_MAX < 1) {
   throw new Error('Invalid rate limit settings. Check RATE_LIMIT_WINDOW_MS and RATE_LIMIT_MAX.');
+}
+
+if (SSH_BOOT_TIMEOUT_MS < 1) {
+  throw new Error('Invalid SSH_BOOT_TIMEOUT_MS value.');
 }
 
 const sessions = new Map(); // token -> session
@@ -95,6 +100,55 @@ function getFreePort() {
       });
     });
     srv.on('error', reject);
+  });
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isTcpPortOpen(host, port, timeoutMs = 1000) {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host, port });
+    let settled = false;
+
+    const finish = (ok) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      socket.destroy();
+      resolve(ok);
+    };
+
+    socket.setTimeout(timeoutMs);
+    socket.once('connect', () => finish(true));
+    socket.once('timeout', () => finish(false));
+    socket.once('error', () => finish(false));
+  });
+}
+
+async function waitForTcpPort(host, port, totalTimeoutMs, pollIntervalMs = 250) {
+  const deadline = Date.now() + totalTimeoutMs;
+
+  while (Date.now() < deadline) {
+    // eslint-disable-next-line no-await-in-loop
+    const open = await isTcpPortOpen(host, port);
+    if (open) {
+      return true;
+    }
+    // eslint-disable-next-line no-await-in-loop
+    await delay(pollIntervalMs);
+  }
+
+  return false;
+}
+
+function spawnChecked(cmd, args, opts = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, opts);
+    child.once('error', reject);
+    child.once('spawn', () => resolve(child));
   });
 }
 
@@ -235,7 +289,11 @@ async function createSession() {
     await sh('ip', ['link', 'set', tap, 'master', BRIDGE_NAME]);
     await sh('ip', ['link', 'set', tap, 'up']);
 
-    firecracker = spawn(FIRECRACKER_BIN, ['--api-sock', sock], { stdio: ['ignore', 'pipe', 'pipe'] });
+    firecracker = await spawnChecked(
+      FIRECRACKER_BIN,
+      ['--api-sock', sock],
+      { stdio: ['ignore', 'ignore', 'ignore'] },
+    );
 
     for (let i = 0; i < 50; i += 1) {
       if (fs.existsSync(sock)) {
@@ -250,7 +308,12 @@ async function createSession() {
       throw new Error('Firecracker socket not created');
     }
 
-    const bootArgs = `console=ttyS0 reboot=k panic=1 pci=off ip=${ip}::${HOST_GW}:255.255.255.0::eth0:off`;
+    await fcReq(sock, 'PUT', '/machine-config', {
+      vcpu_count: 1,
+      mem_size_mib: 512,
+    });
+
+    const bootArgs = `console=ttyS0 reboot=k panic=1 pci=off ip=${ip}::${HOST_GW}:255.255.255.0::eth0:off root=/dev/vda rw init=/sbin/init`;
 
     await fcReq(sock, 'PUT', '/boot-source', {
       kernel_image_path: KERNEL_PATH,
@@ -272,6 +335,11 @@ async function createSession() {
 
     await fcReq(sock, 'PUT', '/actions', { action_type: 'InstanceStart' });
 
+    const sshReady = await waitForTcpPort(ip, 22, SSH_BOOT_TIMEOUT_MS);
+    if (!sshReady) {
+      throw new Error(`SSH did not become ready on ${ip}:22 within ${SSH_BOOT_TIMEOUT_MS} ms`);
+    }
+
     const port = await getFreePort();
     const ttydArgs = [
       '--writable',
@@ -284,7 +352,11 @@ async function createSession() {
       '-o', 'LogLevel=ERROR',
       `root@${ip}`,
     ];
-    ttyd = spawn(TTYD_BIN, ttydArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
+    ttyd = await spawnChecked(
+      TTYD_BIN,
+      ttydArgs,
+      { stdio: ['ignore', 'ignore', 'ignore'] },
+    );
 
     const session = {
       token,
